@@ -6,7 +6,6 @@ no status history (docs/phase0.md §5).
 Every table carries N. numbers.md states what was measured, without interpretation.
 """
 import csv
-import gzip
 import json
 import statistics
 from collections import defaultdict
@@ -20,7 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from build import latest_series, series_ticker_for  # noqa: E402
-from kalshi_api import utcnow  # noqa: E402
+from kalshi_api import read_pages, utcnow  # noqa: E402
 
 DB = Path("data/kalshi.duckdb")
 POLL = Path("data/raw/poll")
@@ -129,31 +128,37 @@ def nonbinary(con) -> list[dict]:
 
 
 def poll_coverage() -> dict:
-    sweeps = [json.loads(line) for line in open(POLL / "sweeps.jsonl")] if (POLL / "sweeps.jsonl").exists() else []
+    sweeps, damaged = [], 0
+    if (POLL / "sweeps.jsonl").exists():
+        for line in open(POLL / "sweeps.jsonl"):
+            try:
+                sweeps.append(json.loads(line))
+            except json.JSONDecodeError:  # a line cut by a crash; poll.py terminates it on restart
+                damaged += 1
     ok = [s for s in sweeps if s["error"] is None]
     if not ok:
-        return {"sweeps_ok": 0, "sweeps_failed": len(sweeps)}
+        return {"sweeps_ok": 0, "sweeps_failed": len(sweeps), "sweeps_damaged": damaged}
     starts = sorted(ts(s["started_at"]) for s in ok)
     gaps = [(b - a).total_seconds() for a, b in zip(starts, starts[1:]) if (b - a).total_seconds() > 2 * POLL_INTERVAL_S]
-    return {"sweeps_ok": len(ok), "sweeps_failed": len(sweeps) - len(ok), "first": ok[0]["started_at"],
+    return {"sweeps_ok": len(ok), "sweeps_failed": len(sweeps) - len(ok), "sweeps_damaged": damaged,
+            "first": ok[0]["started_at"],
             "last": ok[-1]["finished_at"], "span_days": (ts(ok[-1]["finished_at"]) - starts[0]).total_seconds() / 86400,
             "gaps": len(gaps), "gap_hours": sum(gaps) / 3600}
 
 
 def dispute(con, series: dict) -> list[dict]:
     obs = defaultdict(list)  # ticker -> [(observed_at, status, result)], status None = left the closed set
+    # A sweep interrupted by a crash is repeated on restart, so an observation can appear twice; sets below absorb it.
     for path in sorted(POLL.glob("changes-*.jsonl.gz")):
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            for line in f:
-                r = json.loads(line)
-                m = r["market"]
-                obs[r["ticker"]].append((r["observed_at"], m and m.get("status"), m and m.get("result")))
+        for r in read_pages(path):
+            m = r["market"]
+            obs[r["ticker"]].append((r["observed_at"], m and m.get("status"), m and m.get("result")))
     final = dict(con.execute("SELECT ticker, result FROM markets").fetchall())
 
     per = defaultdict(lambda: {"n_observed": 0, "n_disputed": 0, "n_amended": 0, "n_result_changed": 0,
                                "disputed_s": [], "amended_s": [], "n_still_in_review": 0})
     for ticker, events in obs.items():
-        events.sort()
+        events = sorted(set(events))
         c = per[series.get(series_ticker_for(ticker, series)) or "(unknown series)"]
         c["n_observed"] += 1
         statuses = {s for _, s, _ in events}
@@ -221,6 +226,10 @@ def main() -> None:
         "> **Partial dataset.** The crawl had not finished when these numbers were generated "
         f"(historical done={crawl.get('historical', {}).get('done')}, live done={crawl.get('live', {}).get('done')}). "
         "Numbers will change.\n\n")
+    events = crawl.get("events", [])
+    if events:
+        partial += "Crawl events (restarts, cutoff moves), from `data/state/crawl.json`:\n\n" + "".join(
+            f"- {e['at'][:19]}Z: {e['event']}\n" for e in events) + "\n"
     md = f"""# Kalshi Realtime Audit — numbers
 
 **Historical batch (Phases 1–2), not realtime.** Generated {utcnow()[:16]}Z from `data/kalshi.duckdb` (built {ingested}).
@@ -264,6 +273,7 @@ which are also counted in N. Full precision: `out/nonbinary_by_category.csv`.
 ## 3. Dispute trail (forward-only)
 
 Poll coverage: {cov.get('sweeps_ok', 0)} successful sweeps, {cov.get('sweeps_failed', 0)} failed,
+{cov.get('sweeps_damaged', 0)} log lines cut by a crash,
 {cov.get('first', '–')} → {cov.get('last', '–')} ({cov.get('span_days', 0):.1f} days), {cov.get('gaps', 0)} gaps longer than
 {2 * POLL_INTERVAL_S // 60} min totalling {cov.get('gap_hours', 0):.1f} h.
 

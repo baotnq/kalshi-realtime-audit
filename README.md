@@ -19,6 +19,22 @@ make poll      # Metric 3 collector, every 5 min; run on an always-on host (depl
 
 Requires Python 3.10+. No API key is needed.
 
+## Stop and restart
+
+Crawl and poller are safe to interrupt, including a power loss. Run the same command again and they resume.
+
+```
+kill $(cat data/state/crawl.pid) $(cat data/state/poll.pid)       # graceful: stop after the current page/sweep
+nohup .venv/bin/python crawl.py >> data/logs/crawl.log 2>&1 & echo $! > data/state/crawl.pid
+nohup .venv/bin/python poll.py  >> data/logs/poll.log  2>&1 & echo $! > data/state/poll.pid
+```
+
+- Cursors and committed raw-segment sizes are saved after every page. A tail damaged by a crash is never appended to; writing continues in a new segment (`*.0001.jsonl.gz`), and the damage is reported in `data/anomalies.parquet`.
+- The API answers an unusable cursor with HTTP 200 and the first page. `crawl.py` detects that and logs a restart instead of silently re-crawling.
+- If the historical cutoff moves during a crawl, the historical stream is re-crawled.
+- Restarts and cutoff moves are listed in `out/numbers.md`. Poller downtime shows as gaps in poll coverage.
+- `tests/restart_test.py` exercises all of the above (crash mid-write, SIGKILL, SIGTERM, ignored cursor, cutoff move, poller restart) against a temp copy.
+
 ## Layout
 
 | Path | What |

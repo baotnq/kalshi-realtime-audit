@@ -19,9 +19,10 @@ from pathlib import Path
 
 import duckdb
 
-from kalshi_api import read_pages, utcnow
+from kalshi_api import read_segments, utcnow
 
 RAW = Path("data/raw")
+damaged_segments: list[str] = []
 DB = Path("data/kalshi.duckdb")
 ANOMALIES = Path("data/anomalies.parquet")
 
@@ -34,7 +35,7 @@ FIELDS = [
 
 
 def latest_series() -> dict:
-    pages = list(read_pages(RAW / "series.jsonl.gz"))
+    pages = list(read_segments(RAW, "series"))
     if not pages:
         raise SystemExit("no series snapshot; run crawl.py first")
     return {s["ticker"]: s.get("category") for s in json.loads(pages[-1]["body"])["series"]}
@@ -58,10 +59,7 @@ def flatten(tmp: Path, series: dict) -> int:
     n = 0
     with gzip.open(tmp, "wt", encoding="utf-8") as out:
         for source in ("historical", "live"):
-            path = RAW / f"{source}_markets.jsonl.gz"
-            if not path.exists():
-                continue
-            for page in read_pages(path):
+            for page in read_segments(RAW, f"{source}_markets", on_truncated=lambda p: damaged_segments.append(str(p))):
                 for m in json.loads(page["body"]).get("markets", []):
                     row = {f: m.get(f) for f in FIELDS}
                     rules = (m.get("rules_primary") or "") + (m.get("rules_secondary") or "")
@@ -91,6 +89,10 @@ def main() -> None:
         columns.update({"settlement_timer_seconds": "BIGINT", "can_close_early": "BOOLEAN"})
         con.execute("CREATE TEMP TABLE raw_rows AS SELECT * FROM read_json(?, format='newline_delimited', columns=?)",
                     [str(tmp), columns])
+
+    # Damaged segment tails (crash during a write). The page was re-fetched on resume; reported, not dropped.
+    con.execute("CREATE TEMP TABLE damaged(path VARCHAR)")
+    con.executemany("INSERT INTO damaged VALUES (?)", [[p] for p in damaged_segments])
 
     con.execute("CREATE TEMP TABLE series(series_ticker VARCHAR, category VARCHAR)")
     con.executemany("INSERT INTO series VALUES (?, ?)", list(series.items()))
@@ -148,6 +150,9 @@ def main() -> None:
         UNION ALL
         SELECT ticker, 'duplicate_conflict', format('versions={} sources={}', versions, sources)
         FROM conflicts
+        UNION ALL
+        SELECT NULL, 'damaged_raw_segment_tail', format('path={}', path)
+        FROM damaged
     """)
     con.execute(f"COPY (SELECT *, CAST(? AS TIMESTAMPTZ) AS ingested_at FROM anomalies ORDER BY check_name, ticker) "
                 f"TO '{ANOMALIES}' (FORMAT parquet)", [ingested_at])

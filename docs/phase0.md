@@ -21,6 +21,8 @@ GET /historical/cutoff                 → HTTP 200 (no key)
 
 **Page size:** `limit` max 1000 (docs: "Defaults to 100. Maximum value is 1000"). **Cursor:** opaque string in `cursor`; empty when done. [T]
 
+**Invalid cursor is not an error** (checked 2026-09-13): `cursor=garbage` on both `/historical/markets` and `/markets` returns HTTP 200 with the **same first page** as no cursor. [T] Whether cursors expire is undocumented [A-b]. An expired cursor would therefore restart a crawl silently, so `crawl.py` detects a resume that returns the stream's first page and logs it.
+
 **Rate limit (unauthenticated):** not documented. Docs state 429 carries no `Retry-After` / `X-RateLimit-*` headers, token-bucket, "apply exponential backoff". Observed: [T]
 
 | Test | Result |
