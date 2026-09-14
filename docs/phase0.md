@@ -48,6 +48,7 @@ Consequences for `crawl.py`:
 - `/historical/markets` filters are **mutually exclusive** and there are **no time filters** (only `tickers`, `event_ticker`, `series_ticker`, `mve_filter=exclude`). Resume is by cursor only. [T]
 - `/markets` supports `min_settled_ts` / `max_settled_ts`, so the live part can be crawled in time windows. [T]
 - Historical ordering is **not strictly by `settlement_ts`** (8 pages checked: first 2026-07-13T22:36, last 2026-07-12T13:20, not monotonic). [T]
+- **Archival resets `open_interest_fp`** (full dataset, 2026-09-14). The cutoff moved 2026-07-14 → 07-15 during the crawl, so 9,997 markets were stored from both endpoints. Their two copies differ **only** in `open_interest_fp`: nonzero from `/markets`, `0.00` from `/historical/markets` (e.g. `KXUAL-26JULPAX-48500000.0`: 12237.54 vs 0.00). `result`, `settlement_ts`, `settlement_value_dollars` and rules are identical. 9,855 settled 2026-07-14, 142 on 07-15. [T] These are reported as `duplicate_conflict`, and the build keeps the latest fetched copy. The metrics do not use open interest.
 - Depth: `series_ticker=KXHIGHNY` on historical returns 9,178 markets closing 2021-08-07 → 2026-07-13. Old tickers were renamed with a `KX` prefix (`HIGHNY`, `INXD`, `FED` return 0). [T]
 
 ## 3. Field presence on settled markets
@@ -81,7 +82,13 @@ Also present and useful: `status` (always `finalized` on settled), `market_type`
 
 Join rule as first probed: `series_ticker = split(event_ticker, '-')[0]`. Matched **8,000/8,000** historical non-MVE and **1,000/1,000** MVE markets. All MVE combos map to `Exotics`. [T]
 
-**Correction (Phase 2, 2026-09-13):** the first-segment rule fails for series whose ticker contains `-`. `GET /events/KXMLBWINS-BOS-26` returns `series_ticker: KXMLBWINS-BOS`, and `GET /series/KXMLBWINS` returns 404. [T] `build.py` now uses the **longest `-`-separated prefix of `event_ticker` that is a known series**. Unmatched markets are still written to anomalies as `unknown_series`. `GET /events` also carries `category` + `series_ticker` and covers all events regardless of cutoff, but excludes MVE [T]. Prefix join avoids crawling events; a mismatch count goes to anomalies [A].
+**Correction (Phase 2, 2026-09-13):** the first-segment rule fails for series whose ticker contains `-`. `GET /events/KXMLBWINS-BOS-26` returns `series_ticker: KXMLBWINS-BOS`, and `GET /series/KXMLBWINS` returns 404. [T] `build.py` now uses the **longest `-`-separated prefix of `event_ticker` that is a known series**. Unmatched markets are still written to anomalies as `unknown_series`.
+
+**Legacy series (full dataset, 2026-09-14):** 10,313 markets in 1,019 events belong to series that `GET /series` no longer lists: `NASDAQ100D`, `INXD`, `NASDAQ100DU`, `INXDU`, `RENTNYC`, `COVVOHC`, `ALBHAPPIER`, `NYCRENTS`, `GASM` (2021–2025). [T]
+- `GET /series/INXD` returns 404, and `GET /events?series_ticker=INXD` returns 0 events.
+- `GET /events/INXD-22AUG09` still returns the event with `category: Financials`.
+
+`crawl.py --events` fetches those events and `build.py` falls back to the event category. `GET /events` also carries `category` + `series_ticker` and covers all events regardless of cutoff, but excludes MVE [T]. Prefix join avoids crawling events; a mismatch count goes to anomalies [A].
 
 ## 5. Disputed / amended in historical data
 
@@ -125,7 +132,11 @@ The exact non-MVE total is unknown without crawling: `/historical/markets` has n
 
 Samples: 8,000 historical non-MVE + 1,000 live MVE. [T]
 
-- **Brief invariants: 0 violations** in both samples. Checked `created_time < close_time <= settlement_ts`, `result in {yes,no} ⇒ settlement_value_dollars in {0,1}`, and missing `settlement_ts`. The earlier worry about early-close markets was an assumption and did not hold. Early close moves `close_time` earlier, so `close <= settlement` still holds [A].
+- **Brief invariants: 0 violations** in both samples. Checked `created_time < close_time <= settlement_ts`, `result in {yes,no} ⇒ settlement_value_dollars in {0,1}`, and missing `settlement_ts`.
+  - **Correction (full dataset, 2026-09-14):** the sample result does not generalize. Over 15,280,713 markets, **5,451 (0.036%) violate `created_time < close_time <= settlement_ts`** [T]:
+    - 3,336 settled **before** their final `close_time`. Mostly Sports/Entertainment in 2025, e.g. tournament-winner markets such as `KXUSOMENSINGLES-25-*`, settled 2025-08-27 with `close_time` 2025-09-08.
+    - 2,115 have `created_time >= close_time`.
+  - The other two invariants have 0 violations. All violations are kept in `data/anomalies.parquet`.
 - **`settlement_timer_seconds`** (the window in which a determined result can be disputed), non-MVE: 300 s (4,028) · 3,600 s (2,097) · 1 s (711) · 60 s (595) · 180 s (321) · 1,800 s (109). MVE: 5 s (997/1000).
 - **Close → settlement lag**, non-MVE sample: p50 366 s, p90 5,450 s, max 40,529 s. MVE: p50 18 s.
 - **`updated_time` − `settlement_ts`**, non-MVE: p50 0 s. But **1,246/8,000 (15.6%) are more than 1 h**, max ≈ 22 days. The cause is unknown. It may be a trace of post-determination changes [A-b], investigated in `docs/updated_time.md`. MVE: max 1 s.

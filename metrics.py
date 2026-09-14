@@ -18,7 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from build import latest_series, series_ticker_for  # noqa: E402
+from build import latest_event_categories, latest_series, series_ticker_for  # noqa: E402
 from kalshi_api import read_pages, utcnow  # noqa: E402
 
 DB = Path("data/kalshi.duckdb")
@@ -148,18 +148,23 @@ def poll_coverage() -> dict:
 
 def dispute(con, series: dict) -> list[dict]:
     obs = defaultdict(list)  # ticker -> [(observed_at, status, result)], status None = left the closed set
+    event_of = {}
+    event_categories = latest_event_categories()
     # A sweep interrupted by a crash is repeated on restart, so an observation can appear twice; sets below absorb it.
     for path in sorted(POLL.glob("changes-*.jsonl.gz")):
         for r in read_pages(path):
             m = r["market"]
             obs[r["ticker"]].append((r["observed_at"], m and m.get("status"), m and m.get("result")))
+            if m:
+                event_of[r["ticker"]] = m.get("event_ticker")
     final = dict(con.execute("SELECT ticker, result FROM markets").fetchall())
 
     per = defaultdict(lambda: {"n_observed": 0, "n_disputed": 0, "n_amended": 0, "n_result_changed": 0,
                                "disputed_s": [], "amended_s": [], "n_still_in_review": 0})
     for ticker, events in obs.items():
         events = sorted(set(events))
-        c = per[series.get(series_ticker_for(ticker, series)) or "(unknown series)"]
+        c = per[series.get(series_ticker_for(ticker, series)) or event_categories.get(event_of.get(ticker))
+                or "(unknown series)"]
         c["n_observed"] += 1
         statuses = {s for _, s, _ in events}
         c["n_disputed"] += "disputed" in statuses

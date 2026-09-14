@@ -6,6 +6,7 @@ Two sources are required because the API splits data at a cutoff (docs/phase0.md
   historical  GET /historical/markets?mve_filter=exclude     cursor only, no time filter
   live        GET /markets?status=settled&mve_filter=exclude  windowed by settlement time
 Plus GET /historical/cutoff and GET /series (category lookup), once per run.
+`--events` instead fetches GET /events/{ticker} for events build.py left without a category.
 
 Outputs, under data/raw/ (each a stream of gzip segments, see kalshi_api.py):
   cutoff  series  historical_markets  live_markets
@@ -35,6 +36,8 @@ from kalshi_api import SegmentWriter, append_page, fetch, paginate, read_segment
 
 RAW = Path("data/raw")
 STATE = Path("data/state/crawl.json")
+EVENTS_TODO = Path("data/state/unresolved_events.json")  # written by build.py
+EVENTS_CHANGED = Path("data/state/events_changed")        # tells `make data` to rebuild
 LIVE_OVERLAP_S = 3600  # re-read the last hour of the previous live window; filter bounds are not documented as inclusive
 
 lock = threading.Lock()
@@ -123,14 +126,52 @@ def run_stream(name: str, path: str, params: dict, st: dict, state: dict, max_pa
             restarted = True
 
 
+def crawl_events(state: dict) -> None:
+    """GET /events/{ticker} for events build.py could not categorize (legacy series gone from GET /series)."""
+    todo = json.loads(EVENTS_TODO.read_text()) if EVENTS_TODO.exists() else []
+    lookup = state.setdefault("event_lookup", {"fetched": [], "not_found": []})
+    done = set(lookup["fetched"]) | set(lookup["not_found"])
+    pending = [t for t in todo if t not in done]
+    print(f"[events] {len(todo)} uncategorized events listed, {len(pending)} not fetched yet", flush=True)
+    out = writer(state, "events")
+    fetched = 0
+    for ticker in pending:
+        if stop.is_set():
+            print("[events] stop requested; state saved, rerun to resume", flush=True)
+            break
+        fetched_at = utcnow()
+        try:
+            url, body = fetch(f"events/{ticker}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            lookup["not_found"].append(ticker)
+            save(state)
+            continue
+        append_page(out, url, body, fetched_at, event_ticker=ticker)
+        lookup["fetched"].append(ticker)
+        fetched += 1
+        save(state)
+        if fetched % 100 == 0:
+            print(f"[events] {fetched} fetched this run", flush=True)
+    if fetched:
+        EVENTS_CHANGED.touch()
+    print(f"[events] fetched {fetched}, not found so far {len(lookup['not_found'])}", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--max-pages", type=int, help="stop each stream after N pages (testing); resumable")
+    ap.add_argument("--events", action="store_true",
+                    help="only fetch GET /events/{ticker} for events listed by build.py without a category")
     args = ap.parse_args()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
 
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    if args.events:
+        crawl_events(state)
+        return
     hist = state.setdefault("historical", {})
     live = state.setdefault("live", {})
 

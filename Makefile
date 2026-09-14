@@ -11,6 +11,8 @@ $(PY): requirements.txt
 data: $(PY)
 	$(PY) crawl.py
 	$(PY) build.py
+	$(PY) crawl.py --events
+	if [ -f data/state/events_changed ]; then $(PY) build.py && rm data/state/events_changed; fi
 
 # Three numbers per category from data/kalshi.duckdb + the poll log → out/.
 numbers: $(PY)

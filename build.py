@@ -6,7 +6,10 @@ scratch on each run; raw files are only read.
 - One row per ticker. When a ticker appears more than once (live and historical,
   or a page re-read on resume), the most recently fetched copy wins.
 - category = series.category, where series_ticker = the longest prefix of event_ticker
-  that is a known series (docs/phase0.md §4).
+  that is a known series (docs/phase0.md §4). Legacy series missing from GET /series
+  fall back to the event's own category from GET /events/{ticker} (raw stream `events`).
+  Events still without a category are listed in data/state/unresolved_events.json for
+  crawl.py --events.
 - volume = volume_fp as a number (the API has no `volume` field, phase0 §3).
 - record_hash = sha256(rules_primary || rules_secondary), with null read as ''.
 - Invariant violations are written to anomalies and never dropped.
@@ -19,9 +22,10 @@ from pathlib import Path
 
 import duckdb
 
-from kalshi_api import read_segments, utcnow
+from kalshi_api import read_segments, utcnow, write_json_atomic
 
 RAW = Path("data/raw")
+UNRESOLVED_EVENTS = Path("data/state/unresolved_events.json")
 damaged_segments: list[str] = []
 DB = Path("data/kalshi.duckdb")
 ANOMALIES = Path("data/anomalies.parquet")
@@ -39,6 +43,19 @@ def latest_series() -> dict:
     if not pages:
         raise SystemExit("no series snapshot; run crawl.py first")
     return {s["ticker"]: s.get("category") for s in json.loads(pages[-1]["body"])["series"]}
+
+
+def latest_event_categories() -> dict:
+    """event_ticker → category from stored GET /events/{ticker} responses.
+
+    These cover legacy series that GET /series no longer lists (e.g. INXD, NASDAQ100D).
+    """
+    categories = {}
+    for page in read_segments(RAW, "events"):
+        event = json.loads(page["body"]).get("event")
+        if event:
+            categories[event["event_ticker"]] = event.get("category")
+    return categories
 
 
 def series_ticker_for(ticker: str, series: dict) -> str | None:
@@ -97,6 +114,10 @@ def main() -> None:
 
     con.execute("CREATE TEMP TABLE series(series_ticker VARCHAR, category VARCHAR)")
     con.executemany("INSERT INTO series VALUES (?, ?)", list(series.items()))
+    events = latest_event_categories()
+    con.execute("CREATE TEMP TABLE events(event_ticker VARCHAR, category VARCHAR)")
+    if events:
+        con.executemany("INSERT INTO events VALUES (?, ?)", list(events.items()))
 
     # Tickers seen with different content across copies: kept, reported.
     con.execute("""
@@ -112,7 +133,8 @@ def main() -> None:
             FROM raw_rows
         )
         SELECT
-            r.ticker, r.event_ticker, r.series_ticker, s.category, r.market_type, r.status,
+            r.ticker, r.event_ticker, r.series_ticker, coalesce(s.category, e.category) AS category,
+            r.market_type, r.status,
             CAST(r.created_time AS TIMESTAMPTZ) AS created_time,
             CAST(r.open_time AS TIMESTAMPTZ) AS open_time,
             CAST(r.close_time AS TIMESTAMPTZ) AS close_time,
@@ -127,7 +149,9 @@ def main() -> None:
             CAST(r.updated_time AS TIMESTAMPTZ) AS updated_time,
             r.record_hash, r.source, CAST(r.fetched_at AS TIMESTAMPTZ) AS fetched_at, r.page_sha256,
             CAST(? AS TIMESTAMPTZ) AS ingested_at
-        FROM ranked r LEFT JOIN series s USING (series_ticker)
+        FROM ranked r
+        LEFT JOIN series s ON s.series_ticker = r.series_ticker
+        LEFT JOIN events e ON e.event_ticker = r.event_ticker
         WHERE r.rn = 1
     """, [ingested_at])
 
@@ -165,6 +189,10 @@ def main() -> None:
     for check, c in con.execute("SELECT check_name, count(*) FROM anomalies GROUP BY 1 ORDER BY 1").fetchall():
         print(f"  anomaly {check}: {c}")
     print(f"anomalies written to {ANOMALIES}")
+    unresolved = [r[0] for r in con.execute(
+        "SELECT DISTINCT event_ticker FROM markets WHERE category IS NULL ORDER BY 1").fetchall()]
+    write_json_atomic(UNRESOLVED_EVENTS, unresolved)
+    print(f"events without a category: {len(unresolved)} → {UNRESOLVED_EVENTS} (crawl.py --events fetches them)")
     con.close()
 
 

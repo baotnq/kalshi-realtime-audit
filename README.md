@@ -12,7 +12,8 @@ Resolution analytics for Kalshi markets from the public API, with three numbers 
 
 ```
 git clone <repo> && cd kalshi-realtime-audit
-make data      # crawl all settled non-combo markets → data/raw/, build data/kalshi.duckdb (hours; resumable)
+make data      # crawl all settled non-combo markets → data/raw/, build data/kalshi.duckdb (hours; resumable);
+               # then fetch categories for legacy events missing from GET /series and rebuild if any were new
 make numbers   # → out/numbers.md, out/*.csv, out/*.png
 make poll      # Metric 3 collector, every 5 min; run on an always-on host (deploy/kalshi-poll.service)
 ```
