@@ -92,7 +92,8 @@ def main() -> None:
 
     # Damaged segment tails (crash during a write). The page was re-fetched on resume; reported, not dropped.
     con.execute("CREATE TEMP TABLE damaged(path VARCHAR)")
-    con.executemany("INSERT INTO damaged VALUES (?)", [[p] for p in damaged_segments])
+    if damaged_segments:  # executemany rejects an empty parameter list
+        con.executemany("INSERT INTO damaged VALUES (?)", [[p] for p in damaged_segments])
 
     con.execute("CREATE TEMP TABLE series(series_ticker VARCHAR, category VARCHAR)")
     con.executemany("INSERT INTO series VALUES (?, ?)", list(series.items()))

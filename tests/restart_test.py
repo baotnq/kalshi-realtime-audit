@@ -63,6 +63,12 @@ w3 = SegmentWriter(d, "x", {})               # legacy state without a committed 
 check("a4 legacy state: intact last segment is reused", w3.path.name == "x.0001.jsonl.gz", w3.path.name)
 check("a5 gzip_intact detects the cut file", not gzip_intact(d / "x.jsonl.gz"))
 
+# (a') build on clean raw data: no damaged segment must not break the anomaly step
+rc, out = run("crawl.py", "--max-pages", "1")
+check("a6 crawl one page", rc == 0, out[-200:])
+rc, out = run("build.py")
+check("a7 build succeeds when no segment is damaged", rc == 0 and "damaged_raw_segment_tail" not in out, out[-300:])
+
 # (b) crawl killed with SIGKILL, plus a cut tail, then resume and build
 proc = subprocess.Popen([PY, "crawl.py", "--max-pages", "6"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 deadline = time.time() + 300
