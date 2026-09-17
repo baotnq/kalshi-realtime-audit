@@ -1,6 +1,6 @@
 # systemd unit for the Metric 3 poller (docs/phase0.md §8.2).
 # Install on an always-on host:
-#   git clone <repo> /opt/kalshi-realtime-audit && cd /opt/kalshi-realtime-audit && make .venv/bin/python
+#   git clone https://github.com/baotnq/kalshi-realtime-audit.git /opt/kalshi-realtime-audit && cd /opt/kalshi-realtime-audit && make .venv/bin/python
 #   sudo cp deploy/kalshi-poll.service /etc/systemd/system/ && sudo systemctl enable --now kalshi-poll
 # Moving from another host: stop the old poller, copy its data/raw/poll/ and data/state/poll_last.json
 # here first, so coverage in sweeps.jsonl stays one continuous, append-only log.

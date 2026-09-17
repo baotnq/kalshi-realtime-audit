@@ -11,7 +11,7 @@ Resolution analytics for Kalshi markets from the public API, with three numbers 
 ## Run
 
 ```
-git clone <repo> && cd kalshi-realtime-audit
+git clone https://github.com/baotnq/kalshi-realtime-audit.git && cd kalshi-realtime-audit
 make data      # crawl all settled non-combo markets → data/raw/, build data/kalshi.duckdb (hours; resumable);
                # then fetch categories for legacy events missing from GET /series and rebuild if any were new
 make numbers   # → out/numbers.md, out/*.csv, out/*.png
