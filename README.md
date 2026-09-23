@@ -6,6 +6,8 @@ Resolution analytics for Kalshi markets from the public API, with three numbers 
 2. **Non-binary settlement**: markets settling with `result = scalar` or `settlement_value_dollars` ∉ {0, 1}, and their volume.
 3. **Dispute trail**: markets passing through `disputed` / `amended`, time spent there, and result changes.
 
+All three are reported for **traded markets (`volume > 0`) by default**, with the all-market figures alongside every table.
+
 **Metrics 1–2 are a historical batch, not realtime.** **Metric 3 is forward-only.** Kalshi's API exposes no status history, so it is recorded by polling from the first sweep onward. See `docs/phase0.md`.
 
 ## Run

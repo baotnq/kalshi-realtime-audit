@@ -90,7 +90,16 @@ def lag(con) -> list[dict]:
                quantile_cont(epoch(settlement_ts - close_time), 0.99) AS close_to_settle_p99_s,
                quantile_cont(epoch(settlement_ts - expected_expiration_time), 0.5) AS expected_exp_to_settle_p50_s,
                quantile_cont(epoch(settlement_ts - expected_expiration_time), 0.9) AS expected_exp_to_settle_p90_s,
-               avg(CAST(settlement_ts < expected_expiration_time AS INT)) AS share_settled_before_expected_exp
+               avg(CAST(settlement_ts < expected_expiration_time AS INT)) AS share_settled_before_expected_exp,
+               count(*) FILTER (WHERE volume > 0) AS n_traded,
+               quantile_cont(epoch(settlement_ts - close_time), 0.5) FILTER (WHERE volume > 0)
+                   AS close_to_settle_p50_s_traded,
+               quantile_cont(epoch(settlement_ts - close_time), 0.9) FILTER (WHERE volume > 0)
+                   AS close_to_settle_p90_s_traded,
+               quantile_cont(epoch(settlement_ts - close_time), 0.99) FILTER (WHERE volume > 0)
+                   AS close_to_settle_p99_s_traded,
+               quantile_cont(epoch(settlement_ts - expected_expiration_time), 0.5) FILTER (WHERE volume > 0)
+                   AS expected_exp_to_settle_p50_s_traded
         FROM markets WHERE settlement_ts IS NOT NULL
         GROUP BY 1 ORDER BY n DESC
     """
@@ -121,7 +130,11 @@ def nonbinary(con) -> list[dict]:
                sum(volume) AS volume_total,
                coalesce(sum(volume) FILTER (WHERE result = 'scalar' OR settlement_value_dollars NOT IN (0, 1)), 0)
                    AS volume_nonbinary,
-               volume_nonbinary / nullif(volume_total, 0) AS volume_share_nonbinary
+               volume_nonbinary / nullif(volume_total, 0) AS volume_share_nonbinary,
+               count(*) FILTER (WHERE volume > 0) AS n_traded,
+               count(*) FILTER (WHERE volume > 0
+                                AND (result = 'scalar' OR settlement_value_dollars NOT IN (0, 1))) AS n_nonbinary_traded,
+               n_nonbinary_traded / nullif(n_traded, 0) AS share_nonbinary_traded
         FROM markets GROUP BY 1 ORDER BY n DESC
     """
     return [dict(zip([d[0] for d in con.description], r)) for r in con.execute(q).fetchall()]
@@ -149,6 +162,7 @@ def poll_coverage() -> dict:
 def dispute(con, series: dict) -> list[dict]:
     obs = defaultdict(list)  # ticker -> [(observed_at, status, result)], status None = left the closed set
     event_of = {}
+    volume_of = {}
     event_categories = latest_event_categories()
     # A sweep interrupted by a crash is repeated on restart, so an observation can appear twice; sets below absorb it.
     for path in sorted(POLL.glob("changes-*.jsonl.gz")):
@@ -157,15 +171,17 @@ def dispute(con, series: dict) -> list[dict]:
             obs[r["ticker"]].append((r["observed_at"], m and m.get("status"), m and m.get("result")))
             if m:
                 event_of[r["ticker"]] = m.get("event_ticker")
+                volume_of[r["ticker"]] = max(volume_of.get(r["ticker"], 0.0), float(m.get("volume_fp") or 0))
     final = dict(con.execute("SELECT ticker, result FROM markets").fetchall())
 
-    per = defaultdict(lambda: {"n_observed": 0, "n_disputed": 0, "n_amended": 0, "n_result_changed": 0,
-                               "disputed_s": [], "amended_s": [], "n_still_in_review": 0})
+    per = defaultdict(lambda: {"n_observed": 0, "n_observed_traded": 0, "n_disputed": 0, "n_amended": 0,
+                               "n_result_changed": 0, "disputed_s": [], "amended_s": [], "n_still_in_review": 0})
     for ticker, events in obs.items():
         events = sorted(set(events))
         c = per[series.get(series_ticker_for(ticker, series)) or event_categories.get(event_of.get(ticker))
                 or "(unknown series)"]
         c["n_observed"] += 1
+        c["n_observed_traded"] += volume_of.get(ticker, 0) > 0
         statuses = {s for _, s, _ in events}
         c["n_disputed"] += "disputed" in statuses
         c["n_amended"] += "amended" in statuses
@@ -185,7 +201,8 @@ def dispute(con, series: dict) -> list[dict]:
 
     rows = []
     for category, c in sorted(per.items(), key=lambda kv: -kv[1]["n_observed"]):
-        rows.append({"category": category, "n_observed": c["n_observed"], "n_disputed": c["n_disputed"],
+        rows.append({"category": category, "n_observed": c["n_observed"], "n_observed_traded": c["n_observed_traded"],
+                     "n_disputed": c["n_disputed"],
                      "n_amended": c["n_amended"], "n_result_changed": c["n_result_changed"],
                      "n_still_in_review": c["n_still_in_review"],
                      "disputed_median_s": statistics.median(c["disputed_s"]) if c["disputed_s"] else None,
@@ -212,18 +229,20 @@ def main() -> None:
     write_csv(OUT / "elections_lag_rule_change.csv", el_rows)
 
     bar_chart(OUT / "lag_by_category.png", [r["category"] for r in lag_rows],
-              [max(r["close_to_settle_p50_s"], 1) for r in lag_rows],
-              [f"p50 {fmt_s(r['close_to_settle_p50_s'])} · p90 {fmt_s(r['close_to_settle_p90_s'])} · N={r['n']:,}"
-               for r in lag_rows],
-              "Settlement lag: close_time → settlement_ts, median by category",
+              [max(r["close_to_settle_p50_s_traded"] or 0, 1) for r in lag_rows],
+              [f"p50 {fmt_s(r['close_to_settle_p50_s_traded'])} · p90 {fmt_s(r['close_to_settle_p90_s_traded'])}"
+               f" · N={r['n_traded']:,}" for r in lag_rows],
+              "Settlement lag of traded markets: close_time → settlement_ts, median by category",
               "seconds (log scale)", log=True)
     bar_chart(OUT / "nonbinary_by_category.png", [r["category"] for r in nb_rows],
-              [100 * r["share_nonbinary"] for r in nb_rows],
-              [f"{100 * r['share_nonbinary']:.2f}% · {r['n_nonbinary']:,} of N={r['n']:,}" for r in nb_rows],
-              "Non-binary settlement: share of settled markets", "% of markets")
+              [100 * (r["share_nonbinary_traded"] or 0) for r in nb_rows],
+              [f"{100 * (r['share_nonbinary_traded'] or 0):.2f}% · {r['n_nonbinary_traded']:,} of N={r['n_traded']:,}"
+               for r in nb_rows],
+              "Non-binary settlement: share of traded markets", "% of traded markets")
     bar_chart(OUT / "dispute_by_category.png", [r["category"] for r in dsp_rows],
-              [r["n_observed"] for r in dsp_rows],
-              [f"disputed {r['n_disputed']} · amended {r['n_amended']} · N={r['n_observed']:,}" for r in dsp_rows],
+              [r["n_observed_traded"] for r in dsp_rows],
+              [f"disputed {r['n_disputed']} · amended {r['n_amended']} · N={r['n_observed_traded']:,}"
+               for r in dsp_rows],
               f"Dispute trail: closed markets observed by polling ({cov.get('span_days', 0):.1f} days)",
               "markets observed (N)")
 
@@ -244,7 +263,22 @@ Source: Kalshi public REST API, no credentials. Assumptions: `docs/phase0.md`.
 at crawl time (`mve_filter=exclude`). On 2026-09-10 they settled at ≥ 60,000 per sampled hour versus 2,700–4,500 non-combo
 (phase0 §6). Category = the market's series category (`event_ticker` prefix → `GET /series`).
 
+Convention: default figures are traded markets (`volume > 0`); all-market figures are shown alongside. All-market
+columns include markets with zero recorded volume.
+
 ## 1. Settlement lag
+
+{md_table(lag_rows, [("category", "Category", str), ("n_traded", "N", lambda v: f"{v:,}"),
+                     ("close_to_settle_p50_s_traded", "close→settle p50", fmt_s),
+                     ("close_to_settle_p90_s_traded", "p90", fmt_s),
+                     ("close_to_settle_p99_s_traded", "p99", fmt_s),
+                     ("expected_exp_to_settle_p50_s_traded", "expected exp.→settle p50", fmt_s)])}
+Measured: per traded market, `settlement_ts − close_time` and `settlement_ts − expected_expiration_time`, in seconds,
+over markets with a `settlement_ts` that traded at least one contract. Quantiles are continuous. Negative values mean
+settlement came before that timestamp. `close_time` is the final value returned by the API, including early-close
+updates. Full precision, including the all-markets columns: `out/lag_by_category.csv`.
+
+### Reference: all settled markets (incl. zero-volume markets)
 
 {md_table(lag_rows, [("category", "Category", str), ("n", "N", lambda v: f"{v:,}"),
                      ("close_to_settle_p50_s", "close→settle p50", fmt_s),
@@ -252,10 +286,8 @@ at crawl time (`mve_filter=exclude`). On 2026-09-10 they settled at ≥ 60,000 p
                      ("expected_exp_to_settle_p50_s", "expected exp.→settle p50", fmt_s),
                      ("expected_exp_to_settle_p90_s", "p90", fmt_s),
                      ("share_settled_before_expected_exp", "settled before expected exp.", lambda v: f"{100 * v:.1f}%")])}
-Measured: per market, `settlement_ts − close_time` and `settlement_ts − expected_expiration_time`, in seconds, over all
-settled markets with a `settlement_ts`. Quantiles are continuous. Negative values mean settlement came before that
-timestamp. `close_time` is the final value returned by the API, including early-close updates. Full precision:
-`out/lag_by_category.csv`.
+This view counts every settled market, including markets with zero recorded volume. The raw Commodities p99 is inflated
+by a batch of zero-volume brackets settled on one date; the `volume > 0` figure is reported as primary.
 
 ### Elections, before vs after {RULE_CHANGE}
 
@@ -266,14 +298,18 @@ Measured: the same lag for category Elections, split by whether `close_time` is 
 
 ## 2. Non-binary settlement
 
-{md_table(nb_rows, [("category", "Category", str), ("n", "N", lambda v: f"{v:,}"),
-                    ("n_nonbinary", "non-binary", lambda v: f"{v:,}"),
-                    ("share_nonbinary", "share", lambda v: f"{100 * v:.2f}%"),
-                    ("n_result_other", "result not yes/no/scalar", lambda v: f"{v:,}"),
-                    ("volume_share_nonbinary", "share of volume", lambda v: "–" if v is None else f"{100 * v:.2f}%")])}
-Measured: a market counts as non-binary when `result = scalar` or `settlement_value_dollars` ∉ {{0, 1}}. Volume is
-`volume_fp` (contracts) summed per group. The "result not yes/no/scalar" column counts other or empty `result` values,
-which are also counted in N. Full precision: `out/nonbinary_by_category.csv`.
+{md_table(nb_rows, [("category", "Category", str), ("n_traded", "N", lambda v: f"{v:,}"),
+                    ("n_nonbinary_traded", "non-binary", lambda v: f"{v:,}"),
+                    ("share_nonbinary_traded", "share", lambda v: "–" if v is None else f"{100 * v:.2f}%"),
+                    ("volume_share_nonbinary", "share of volume", lambda v: "–" if v is None else f"{100 * v:.2f}%"),
+                    ("n", "N all markets (incl. zero-volume)", lambda v: f"{v:,}"),
+                    ("n_nonbinary", "non-binary (all)", lambda v: f"{v:,}"),
+                    ("share_nonbinary", "share (all)", lambda v: f"{100 * v:.2f}%"),
+                    ("n_result_other", "result not yes/no/scalar", lambda v: f"{v:,}")])}
+Measured: a market counts as non-binary when `result = scalar` or `settlement_value_dollars` ∉ {{0, 1}}. The first three
+columns count traded markets only; the "(all)" columns add markets with zero recorded volume. Volume is `volume_fp` (contracts)
+summed per group over all markets. The "result not yes/no/scalar" column counts other or empty `result` values, which
+are also counted in N all markets. Full precision: `out/nonbinary_by_category.csv`.
 
 ## 3. Dispute trail (forward-only)
 
@@ -282,17 +318,22 @@ Poll coverage: {cov.get('sweeps_ok', 0)} successful sweeps, {cov.get('sweeps_fai
 {cov.get('first', '–')} → {cov.get('last', '–')} ({cov.get('span_days', 0):.1f} days), {cov.get('gaps', 0)} gaps longer than
 {2 * POLL_INTERVAL_S // 60} min totalling {cov.get('gap_hours', 0):.1f} h.
 
-{md_table(dsp_rows, [("category", "Category", str), ("n_observed", "N observed", lambda v: f"{v:,}"),
+{md_table(dsp_rows, [("category", "Category", str), ("n_observed_traded", "N traded", lambda v: f"{v:,}"),
+                     ("n_observed", "N observed (all, incl. zero-volume)", lambda v: f"{v:,}"),
                      ("n_disputed", "disputed", str), ("n_amended", "amended", str),
                      ("n_result_changed", "result changed", str), ("n_still_in_review", "still in review", str),
                      ("disputed_median_s", "median time disputed", fmt_s),
                      ("amended_median_s", "median time amended", fmt_s)])}
 Measured: `GET /markets?status=closed&mve_filter=exclude` polled every {POLL_INTERVAL_S // 60} min since the first sweep.
-N observed = distinct markets seen at least once in `closed`/`determined`/`disputed`/`amended`. A market counts as
+N observed = distinct markets seen at least once in `closed`/`determined`/`disputed`/`amended`; N traded counts those
+whose `volume_fp` was above zero in any sweep. A market counts as
 disputed or amended if any sweep saw it in that status. Time in a status runs from the first sweep that saw it to the
 first later sweep that did not, so it is accurate to ± one poll interval, and a status shorter than the interval can be
 missed. Result changed = more than one distinct non-empty `result` across sweeps and the final settled record. The
 Kalshi API exposes no status history, so none of this exists before the first sweep.
+
+Invariant checks run in `build.py`; their output is kept in `data/anomalies.parquet` and nothing is dropped from the
+tables above.
 """
     (OUT / "numbers.md").write_text(md)
     print(md)

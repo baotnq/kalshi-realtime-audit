@@ -26,6 +26,8 @@ from kalshi_api import read_segments, utcnow, write_json_atomic
 
 RAW = Path("data/raw")
 UNRESOLVED_EVENTS = Path("data/state/unresolved_events.json")
+BULK_BATCH_MIN_MARKETS = 500   # markets of one series settled on one day …
+BULK_BATCH_MIN_LAG_DAYS = 30   # … with a median close→settlement lag above this
 damaged_segments: list[str] = []
 DB = Path("data/kalshi.duckdb")
 ANOMALIES = Path("data/anomalies.parquet")
@@ -34,7 +36,7 @@ FIELDS = [
     "ticker", "event_ticker", "market_type", "status", "created_time", "open_time", "close_time",
     "expected_expiration_time", "latest_expiration_time", "expiration_time", "settlement_ts",
     "settlement_timer_seconds", "result", "settlement_value_dollars", "early_close_condition",
-    "can_close_early", "rules_primary", "rules_secondary", "volume_fp", "updated_time",
+    "can_close_early", "rules_primary", "rules_secondary", "volume_fp", "open_interest_fp", "updated_time",
 ]
 
 
@@ -146,6 +148,7 @@ def main() -> None:
             CAST(r.settlement_value_dollars AS DECIMAL(10, 4)) AS settlement_value_dollars,
             r.early_close_condition, r.can_close_early, r.rules_primary, r.rules_secondary,
             CAST(r.volume_fp AS DOUBLE) AS volume,
+            CAST(r.open_interest_fp AS DOUBLE) AS open_interest,
             CAST(r.updated_time AS TIMESTAMPTZ) AS updated_time,
             r.record_hash, r.source, CAST(r.fetched_at AS TIMESTAMPTZ) AS fetched_at, r.page_sha256,
             CAST(? AS TIMESTAMPTZ) AS ingested_at
@@ -154,6 +157,27 @@ def main() -> None:
         LEFT JOIN events e ON e.event_ticker = r.event_ticker
         WHERE r.rn = 1
     """, [ingested_at])
+
+    # Many markets of one series settled on the same day, long after they closed. Their timestamps are
+    # self-consistent, so the invariant checks above do not see them.
+    con.execute(f"""
+        CREATE TEMP TABLE batches AS
+        SELECT series_ticker, strftime(settlement_ts AT TIME ZONE 'UTC', '%Y-%m-%d') AS settled_date,
+               count(*) AS n, median(epoch(settlement_ts - close_time)) / 86400 AS median_lag_days
+        FROM markets WHERE settlement_ts IS NOT NULL
+        GROUP BY 1, 2
+        HAVING count(*) >= {BULK_BATCH_MIN_MARKETS} AND median_lag_days > {BULK_BATCH_MIN_LAG_DAYS}
+    """)
+    # Only the late markets of such a day; the same series also settles its current markets normally that day.
+    con.execute(f"""
+        CREATE TEMP TABLE bulk_flagged AS
+        SELECT m.ticker, b.n, b.series_ticker, b.settled_date, m.volume,
+               round(epoch(m.settlement_ts - m.close_time) / 86400, 1) AS lag_days
+        FROM markets m
+        JOIN batches b ON b.series_ticker = m.series_ticker
+                      AND b.settled_date = strftime(m.settlement_ts AT TIME ZONE 'UTC', '%Y-%m-%d')
+        WHERE epoch(m.settlement_ts - m.close_time) / 86400 > {BULK_BATCH_MIN_LAG_DAYS}
+    """)
 
     con.execute("""
         CREATE TEMP TABLE anomalies AS
@@ -178,6 +202,11 @@ def main() -> None:
         UNION ALL
         SELECT NULL, 'damaged_raw_segment_tail', format('path={}', path)
         FROM damaged
+        UNION ALL
+        SELECT ticker, 'bulk_settlement_batch',
+               format('series {} settled {} markets on {}; this one waited {} days, volume {}',
+                      series_ticker, n, settled_date, lag_days, volume)
+        FROM bulk_flagged
     """)
     con.execute(f"COPY (SELECT *, CAST(? AS TIMESTAMPTZ) AS ingested_at FROM anomalies ORDER BY check_name, ticker) "
                 f"TO '{ANOMALIES}' (FORMAT parquet)", [ingested_at])
